@@ -136,6 +136,14 @@ def _print_config(context: cloup.Context):
 @femto.fe.utils.cli.add_options(femto.fe.utils.cli.DEFAULT_LIGAND_PATHS_GROUP)
 @femto.fe.utils.cli.add_options(femto.fe.utils.cli.DEFAULT_LIGAND_OPTIONS_GROUP)
 @femto.fe.utils.cli.add_options(femto.fe.utils.cli.DEFAULT_OUTPUTS_GROUP)
+@cloup.option(
+    "--oversubscribe",
+    type=int,
+    default=None,
+    help="Number of MPI ranks to run per GPU using CUDA MPS. When set, "
+    "automatically starts/stops the MPS daemon and launches under mpirun "
+    "with n_gpus * N total ranks.",
+)
 @cloup.pass_context
 def _run_solution_cli(
     context: cloup.Context,
@@ -151,10 +159,17 @@ def _run_solution_cli(
     ligand_2_ref_atoms: tuple[str, str, str] | None,
     output_dir: pathlib.Path,
     report_dir: pathlib.Path | None,
+    oversubscribe: int | None,
 ):
     import femto.fe.septop
 
     config = context.obj
+
+    # If --oversubscribe is set and we're not already inside MPI, re-launch
+    # under mpirun with MPS enabled and exit.
+    if oversubscribe is not None and not femto.md.utils.mpi.is_inside_mpi():
+        rc = femto.md.utils.mpi.launch_with_mps(oversubscribe)
+        raise SystemExit(rc)
 
     using_directory, _ = femto.fe.utils.cli.validate_mutually_exclusive_groups(
         context,
@@ -209,6 +224,14 @@ def _run_solution_cli(
 @femto.fe.utils.cli.add_options(femto.fe.utils.cli.DEFAULT_RECEPTOR_PATHS_GROUP)
 @femto.fe.utils.cli.add_options(_RECEPTOR_OPTIONS_GROUP)
 @femto.fe.utils.cli.add_options(femto.fe.utils.cli.DEFAULT_OUTPUTS_GROUP)
+@cloup.option(
+    "--oversubscribe",
+    type=int,
+    default=None,
+    help="Number of MPI ranks to run per GPU using CUDA MPS. When set, "
+    "automatically starts/stops the MPS daemon and launches under mpirun "
+    "with n_gpus * N total ranks.",
+)
 @cloup.pass_context
 def _run_complex_cli(
     context: cloup.Context,
@@ -227,10 +250,17 @@ def _run_complex_cli(
     ligand_2_ref_atoms: tuple[str, str, str] | None,
     output_dir: pathlib.Path,
     report_dir: pathlib.Path | None,
+    oversubscribe: int | None,
 ):
     import femto.fe.septop
 
     config = context.obj
+
+    # If --oversubscribe is set and we're not already inside MPI, re-launch
+    # under mpirun with MPS enabled and exit.
+    if oversubscribe is not None and not femto.md.utils.mpi.is_inside_mpi():
+        rc = femto.md.utils.mpi.launch_with_mps(oversubscribe)
+        raise SystemExit(rc)
 
     using_directory, _ = femto.fe.utils.cli.validate_mutually_exclusive_groups(
         context,
