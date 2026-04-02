@@ -187,18 +187,20 @@ def is_inside_mpi() -> bool:
 
 
 def is_mps_running() -> bool:
-    """Check if the CUDA MPS daemon is currently running."""
+    """Check if the CUDA MPS daemon is currently running.
+
+    Uses a ps-based process check instead of the interactive control
+    pipe, which can hang on newer NVIDIA drivers (580+).
+    """
 
     if not shutil.which("nvidia-cuda-mps-control"):
         return False
 
     try:
         result = subprocess.run(
-            ["nvidia-cuda-mps-control"],
-            input="get_default_active_thread_percentage\n",
+            ["pgrep", "-f", "nvidia-cuda-mps-server"],
             capture_output=True,
-            text=True,
-            timeout=5,
+            timeout=3,
         )
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -224,6 +226,9 @@ def start_mps() -> None:
 
     _LOGGER.info("Starting CUDA MPS daemon")
     subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
+    # Allow the daemon a moment to become ready before MPI ranks attach
+    import time
+    time.sleep(2)
 
 
 def stop_mps() -> None:
