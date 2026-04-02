@@ -203,17 +203,21 @@ def _compute_reduced_potentials(
 
     reduced_potentials = numpy.zeros(len(states))
 
+    current_params: dict[str, float] = {}
+
     for state_idx, state in enumerate(states):
         for key, value in state.items():
-            context.setParameter(key, value)
+            if current_params.get(key) != value:
+                context.setParameter(key, value)
+                current_params[key] = value
 
+        omm_state = context.getState(getEnergy=True, groups=force_groups)
         reduced_potential = (
-            context.getState(getEnergy=True, groups=force_groups).getPotentialEnergy()
-            / openmm.unit.AVOGADRO_CONSTANT_NA
+            omm_state.getPotentialEnergy() / openmm.unit.AVOGADRO_CONSTANT_NA
         )
 
         if pressure is not None:
-            reduced_potential += pressure * context.getState().getPeriodicBoxVolume()
+            reduced_potential += pressure * omm_state.getPeriodicBoxVolume()
 
         reduced_potentials[state_idx] = beta * reduced_potential
 
