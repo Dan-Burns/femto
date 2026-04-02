@@ -271,11 +271,11 @@ def _strip_oversubscribe_from_argv(argv: list[str]) -> list[str]:
             skip_next = False
             continue
 
-        if arg == "--oversubscribe":
+        if arg in ("--oversubscribe", "-o"):
             skip_next = True
             continue
 
-        if arg.startswith("--oversubscribe="):
+        if arg.startswith("--oversubscribe=") or arg.startswith("-o="):
             continue
 
         result.append(arg)
@@ -317,6 +317,9 @@ def launch_with_mps(
     thread_pct = max(1, 200 // oversubscribe)
 
     child_argv = _strip_oversubscribe_from_argv(sys.argv)
+    
+    if child_argv and child_argv[0].endswith(".py"):
+        child_argv = [sys.executable, *child_argv]
 
     if mpi_command is not None:
         mpi_cmd = shlex.split(mpi_command) + ["-n", str(n_ranks)]
