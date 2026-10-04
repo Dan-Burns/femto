@@ -84,9 +84,15 @@ def assign_force_groups(system: openmm.System):
         elif isinstance(force, openmm.HarmonicAngleForce):
             force.setForceGroup(OpenMMForceGroup.ANGLE)
         elif isinstance(
-            force, (openmm.PeriodicTorsionForce, openmm.CustomTorsionForce)
+            force, (openmm.PeriodicTorsionForce, openmm.CustomTorsionForce, openmm.CMAPTorsionForce)
         ):
             force.setForceGroup(OpenMMForceGroup.DIHEDRAL)
+        elif isinstance(force, openmm.CustomCVForce):
+            inner_force = force.getCollectiveVariable(0)
+            if isinstance(inner_force, openmm.CMAPTorsionForce):
+                force.setForceGroup(OpenMMForceGroup.DIHEDRAL)
+            else:
+                force.setForceGroup(OpenMMForceGroup.OTHER)
         elif isinstance(force, (openmm.NonbondedForce, openmm.CustomNonbondedForce)):
             force.setForceGroup(OpenMMForceGroup.NONBONDED)
         elif isinstance(force, openmm.ATMForce):

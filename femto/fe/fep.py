@@ -34,6 +34,7 @@ _SUPPORTED_FORCES = [
     openmm.HarmonicBondForce,
     openmm.HarmonicAngleForce,
     openmm.PeriodicTorsionForce,
+    openmm.CMAPTorsionForce,
     openmm.NonbondedForce,
     openmm.MonteCarloBarostat,
     openmm.CMMotionRemover,

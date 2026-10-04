@@ -17,6 +17,7 @@ _SUPPORTED_FORCES = [
     openmm.HarmonicBondForce,
     openmm.HarmonicAngleForce,
     openmm.PeriodicTorsionForce,
+    openmm.CMAPTorsionForce,
     openmm.NonbondedForce,
     openmm.CustomNonbondedForce,
     openmm.MonteCarloBarostat,
@@ -68,6 +69,74 @@ def _create_torsion_force(
         custom_force.addTorsion(*idxs, [is_ss, is_sw, is_ww, periodicity, phase, k])
 
     return custom_force
+
+
+def _create_cmap_force(
+    force: openmm.CMAPTorsionForce, solute_idxs: set[int]
+) -> list[openmm.Force]:
+    """Create a set of CustomCVForces and CMAPTorsionForces that apply REST2 scaling."""
+    unscaled_cmap = openmm.CMAPTorsionForce()
+    unscaled_cmap.setUsesPeriodicBoundaryConditions(force.usesPeriodicBoundaryConditions())
+    
+    scaled_ss_cmap = openmm.CMAPTorsionForce()
+    scaled_ss_cmap.setUsesPeriodicBoundaryConditions(force.usesPeriodicBoundaryConditions())
+    
+    scaled_sw_cmap = openmm.CMAPTorsionForce()
+    scaled_sw_cmap.setUsesPeriodicBoundaryConditions(force.usesPeriodicBoundaryConditions())
+    
+    for i in range(force.getNumMaps()):
+        size, energy = force.getMapParameters(i)
+        unscaled_cmap.addMap(size, energy)
+        scaled_ss_cmap.addMap(size, energy)
+        scaled_sw_cmap.addMap(size, energy)
+        
+    has_unscaled = False
+    has_ss = False
+    has_sw = False
+    
+    for i in range(force.getNumTorsions()):
+        map_idx, a1, a2, a3, a4, b1, b2, b3, b4 = force.getTorsionParameters(i)
+        atoms = {a1, a2, a3, a4, b1, b2, b3, b4}
+        
+        if atoms.isdisjoint(solute_idxs):
+            unscaled_cmap.addTorsion(map_idx, a1, a2, a3, a4, b1, b2, b3, b4)
+            has_unscaled = True
+        elif atoms.issubset(solute_idxs):
+            scaled_ss_cmap.addTorsion(map_idx, a1, a2, a3, a4, b1, b2, b3, b4)
+            has_ss = True
+        else:
+            scaled_sw_cmap.addTorsion(map_idx, a1, a2, a3, a4, b1, b2, b3, b4)
+            has_sw = True
+
+    forces_to_return = []
+    
+    if has_unscaled:
+        unscaled_cmap.setForceGroup(force.getForceGroup())
+        if force.getName():
+            unscaled_cmap.setName(force.getName() + "_ww")
+        forces_to_return.append(unscaled_cmap)
+        
+    if has_ss:
+        cv_ss = openmm.CustomCVForce(f"{REST_CTX_PARAM} * u_cmap_ss")
+        cv_ss.addGlobalParameter(REST_CTX_PARAM, 1.0)
+        cv_ss.addEnergyParameterDerivative(REST_CTX_PARAM)
+        cv_ss.addCollectiveVariable("u_cmap_ss", scaled_ss_cmap)
+        cv_ss.setForceGroup(force.getForceGroup())
+        if force.getName():
+            cv_ss.setName(force.getName() + "_ss")
+        forces_to_return.append(cv_ss)
+        
+    if has_sw:
+        cv_sw = openmm.CustomCVForce(f"{REST_CTX_PARAM_SQRT} * u_cmap_sw")
+        cv_sw.addGlobalParameter(REST_CTX_PARAM_SQRT, 1.0)
+        cv_sw.addEnergyParameterDerivative(REST_CTX_PARAM_SQRT)
+        cv_sw.addCollectiveVariable("u_cmap_sw", scaled_sw_cmap)
+        cv_sw.setForceGroup(force.getForceGroup())
+        if force.getName():
+            cv_sw.setName(force.getName() + "_sw")
+        forces_to_return.append(cv_sw)
+        
+    return forces_to_return
 
 
 def _scale_nonbonded_offsets(force: openmm.NonbondedForce, offset_idxs: list[int]):
@@ -287,18 +356,21 @@ def apply_rest(
             elif force_type == openmm.HarmonicAngleForce and config.scale_angles:
                 raise NotImplementedError("Scaling of angles is not yet supported.")
             elif force_type == openmm.PeriodicTorsionForce and config.scale_torsions:
-                force = _create_torsion_force(force, solute_idxs)
+                forces_to_add = [_create_torsion_force(force, solute_idxs)]
+            elif force_type == openmm.CMAPTorsionForce and config.scale_torsions:
+                forces_to_add = _create_cmap_force(force, solute_idxs)
             elif (
                 force_type in (openmm.NonbondedForce, openmm.CustomNonbondedForce)
                 and config.scale_nonbonded
             ):
-                force = _create_nonbonded_force(force, solute_idxs)
+                forces_to_add = [_create_nonbonded_force(force, solute_idxs)]
             else:
-                force = copy.deepcopy(force)
+                forces_to_add = [copy.deepcopy(force)]
 
-            rest_forces[i] = force
+            rest_forces[i] = forces_to_add
 
     for i in reversed(range(system.getNumForces())):
         system.removeForce(i)
     for i in range(len(rest_forces)):
-        system.addForce(rest_forces[i])
+        for force in rest_forces[i]:
+            system.addForce(force)
