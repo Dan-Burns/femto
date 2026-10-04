@@ -4,7 +4,7 @@ import copy
 import pathlib
 
 import mdtop
-import numpy.linalg.linalg
+import numpy.linalg
 import openmm
 import openmm.app
 import openmm.unit
