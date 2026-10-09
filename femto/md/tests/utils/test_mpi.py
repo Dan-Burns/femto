@@ -103,27 +103,40 @@ def test_divide_tasks(mocker):
     assert return_values == [(2, 0), (2, 2), (2, 4), (2, 6), (1, 8)]
 
 
-@pytest.mark.parametrize(
-    "rank, expected_gpu_idx", [(0, 0), (1, 1), (2, 2), (3, 0), (4, 1)]
-)
-def test_divide_gpus(rank, expected_gpu_idx, mocker):
-    world_size = 5
-
+def _mock_node_comm(mocker, node_rank, node_size):
     mock_comm_ctx = mocker.MagicMock()
     mock_comm = mock_comm_ctx.__enter__.return_value
-    mock_comm.size = world_size
-    mock_comm.rank = rank
+    mock_comm.rank = 10 + node_rank  # global rank differs from the node-local rank
+    mock_comm.Split_type.return_value = mocker.MagicMock(
+        rank=node_rank, size=node_size
+    )
 
     mocker.patch(
         "femto.md.utils.mpi.get_mpi_comm",
         autospec=True,
         return_value=mock_comm_ctx,
     )
-    mocker.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1,2"})
+
+
+@pytest.mark.parametrize(
+    "use_mps, node_rank, expected_device",
+    [
+        (False, 0, "4"),
+        (False, 2, "6"),
+        (False, 4, "5"),
+        (True, 0, "0"),
+        (True, 2, "2"),
+        (True, 4, "1"),
+    ],
+)
+def test_divide_gpus(use_mps, node_rank, expected_device, mocker):
+    _mock_node_comm(mocker, node_rank, node_size=5)
+    mocker.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,5,6"})
+    mocker.patch("femto.md.utils.mpi.is_mps_running", return_value=use_mps)
 
     femto.md.utils.mpi.divide_gpus()
 
-    assert os.environ["CUDA_VISIBLE_DEVICES"] == str(expected_gpu_idx)
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == expected_device
 
 
 def test_run_on_rank_zero():
@@ -147,25 +160,16 @@ class TestIsInsideMpi:
 
 
 class TestIsMpsRunning:
-    def test_no_mps_control_binary(self, mocker):
-        mocker.patch("shutil.which", return_value=None)
-        assert femto.md.utils.mpi.is_mps_running() is False
+    @pytest.mark.parametrize(
+        "pid, expected", [(None, False), ("not-a-pid", False), (os.getpid(), True)]
+    )
+    def test_pid_file(self, pid, expected, tmp_path, mocker):
+        mocker.patch.dict(os.environ, {"CUDA_MPS_PIPE_DIRECTORY": str(tmp_path)})
 
-    def test_mps_running(self, mocker):
-        mocker.patch("shutil.which", return_value="/usr/bin/nvidia-cuda-mps-control")
-        mocker.patch(
-            "subprocess.run",
-            return_value=mocker.MagicMock(returncode=0),
-        )
-        assert femto.md.utils.mpi.is_mps_running() is True
+        if pid is not None:
+            (tmp_path / "nvidia-cuda-mps-control.pid").write_text(str(pid))
 
-    def test_mps_not_running(self, mocker):
-        mocker.patch("shutil.which", return_value="/usr/bin/nvidia-cuda-mps-control")
-        mocker.patch(
-            "subprocess.run",
-            return_value=mocker.MagicMock(returncode=1),
-        )
-        assert femto.md.utils.mpi.is_mps_running() is False
+        assert femto.md.utils.mpi.is_mps_running() is expected
 
 
 class TestStartStopMps:
@@ -186,7 +190,9 @@ class TestStartStopMps:
 
     def test_start_mps(self, mocker):
         mocker.patch("shutil.which", return_value="/usr/bin/nvidia-cuda-mps-control")
-        mocker.patch("femto.md.utils.mpi.is_mps_running", return_value=False)
+        mocker.patch(
+            "femto.md.utils.mpi.is_mps_running", side_effect=[False, False, True]
+        )
         mock_run = mocker.patch("subprocess.run")
 
         femto.md.utils.mpi.start_mps()
@@ -242,6 +248,61 @@ class TestMpsContext:
         mock_stop.assert_called_once()
 
 
+class TestNodeMps:
+    @pytest.fixture
+    def mock_env(self, mocker):
+        env = {"CUDA_VISIBLE_DEVICES": "0"}
+        mocker.patch.dict(os.environ, env, clear=True)
+        return env
+
+    def test_skips_if_ranks_fit_on_gpus(self, mock_env, mocker):
+        mock_start = mocker.patch("femto.md.utils.mpi.start_mps")
+        comm = mocker.MagicMock()
+        comm.Split_type.return_value = mocker.MagicMock(rank=0, size=1)
+
+        with femto.md.utils.mpi.node_mps(comm):
+            pass
+
+        mock_start.assert_not_called()
+        assert "CUDA_MPS_PIPE_DIRECTORY" not in os.environ
+
+    @pytest.mark.parametrize("node_rank", [0, 1])
+    def test_starts_and_stops_owned_daemon(self, mock_env, node_rank, mocker):
+        mock_start = mocker.patch("femto.md.utils.mpi.start_mps")
+        mock_stop = mocker.patch("subprocess.Popen")
+
+        node_comm = mocker.MagicMock(rank=node_rank, size=2)
+        node_comm.bcast.side_effect = lambda value, root: (
+            value if node_rank == 0 else ("/tmp/femto-mps-x", None)
+        )
+        comm = mocker.MagicMock()
+        comm.Split_type.return_value = node_comm
+
+        with femto.md.utils.mpi.node_mps(comm):
+            pipe_dir = os.environ["CUDA_MPS_PIPE_DIRECTORY"]
+            assert pipe_dir.startswith("/tmp/femto-mps-")
+            assert os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] == "100"
+
+        assert mock_start.call_count == mock_stop.call_count == (node_rank == 0)
+        if node_rank == 0:
+            assert "echo quit | nvidia-cuda-mps-control" in mock_stop.call_args[0][0]
+            shutil.rmtree(os.path.dirname(pipe_dir))
+
+    def test_uses_external_daemon(self, mock_env, mocker):
+        mock_start = mocker.patch("femto.md.utils.mpi.start_mps")
+        mock_stop = mocker.patch("subprocess.Popen")
+        os.environ["CUDA_MPS_PIPE_DIRECTORY"] = "/site/mps"
+
+        comm = mocker.MagicMock()
+        comm.Split_type.return_value = mocker.MagicMock(rank=0, size=2)
+
+        with femto.md.utils.mpi.node_mps(comm):
+            assert os.environ["CUDA_MPS_PIPE_DIRECTORY"] == "/site/mps"
+
+        mock_start.assert_not_called()
+        mock_stop.assert_not_called()
+
+
 class TestStripOversubscribeFromArgv:
     def test_strip_separate_args(self):
         argv = ["femto", "septop", "run-complex", "--oversubscribe", "4", "--output-dir", "/tmp"]
@@ -261,13 +322,13 @@ class TestStripOversubscribeFromArgv:
 
 class TestLaunchWithMps:
     def test_no_gpus(self, mocker):
-        mocker.patch("femto.md.utils.mpi._count_cuda_devices", return_value=0)
+        mocker.patch("femto.md.utils.mpi._visible_devices", return_value=[])
 
         with pytest.raises(RuntimeError, match="No CUDA devices found"):
             femto.md.utils.mpi.launch_with_mps(2)
 
     def test_no_mpirun(self, mocker):
-        mocker.patch("femto.md.utils.mpi._count_cuda_devices", return_value=2)
+        mocker.patch("femto.md.utils.mpi._visible_devices", return_value=["0", "1"])
         mocker.patch("shutil.which", return_value=None)
         mocker.patch("sys.argv", ["femto", "septop", "run-complex"])
 
@@ -275,7 +336,7 @@ class TestLaunchWithMps:
             femto.md.utils.mpi.launch_with_mps(2)
 
     def test_launch_auto_detect_mpi(self, mocker):
-        mocker.patch("femto.md.utils.mpi._count_cuda_devices", return_value=2)
+        mocker.patch("femto.md.utils.mpi._visible_devices", return_value=["0", "1"])
         mocker.patch(
             "shutil.which",
             side_effect=lambda cmd: "/usr/bin/mpirun" if cmd == "mpirun" else None,
@@ -310,7 +371,7 @@ class TestLaunchWithMps:
         assert env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] == "50"
 
     def test_launch_custom_mpi_command(self, mocker):
-        mocker.patch("femto.md.utils.mpi._count_cuda_devices", return_value=1)
+        mocker.patch("femto.md.utils.mpi._visible_devices", return_value=["0"])
         mocker.patch("sys.argv", ["femto", "septop", "run-complex", "--output-dir", "/tmp"])
         mock_mps_ctx = mocker.patch("femto.md.utils.mpi.mps_context")
         mock_mps_ctx.return_value.__enter__ = mocker.MagicMock()
@@ -332,16 +393,7 @@ class TestLaunchWithMps:
 class TestDivideGpusMps:
     def test_warns_no_mps(self, mocker, caplog):
         """Should warn when multiple ranks share a GPU but MPS is not running."""
-        mock_comm_ctx = mocker.MagicMock()
-        mock_comm = mock_comm_ctx.__enter__.return_value
-        mock_comm.size = 4
-        mock_comm.rank = 0
-
-        mocker.patch(
-            "femto.md.utils.mpi.get_mpi_comm",
-            autospec=True,
-            return_value=mock_comm_ctx,
-        )
+        _mock_node_comm(mocker, node_rank=0, node_size=4)
         mocker.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1"})
         mocker.patch("femto.md.utils.mpi.is_mps_running", return_value=False)
 

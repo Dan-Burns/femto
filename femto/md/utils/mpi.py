@@ -4,12 +4,15 @@ import contextlib
 import functools
 import logging
 import os
+import pathlib
 import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import time
 import typing
 
 import GPUtil
@@ -167,16 +170,16 @@ def divide_tasks(mpi_comm: "MPI.Intracomm", n_tasks: int) -> tuple[int, int]:
     return n_replicas, replica_idx_offset
 
 
-def _count_cuda_devices() -> int:
-    """Count the number of available CUDA devices."""
+def _visible_devices() -> list[str]:
+    """Return the ids of the CUDA devices visible to this process."""
 
     if "CUDA_VISIBLE_DEVICES" in os.environ:
-        return len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+        return [d for d in os.environ["CUDA_VISIBLE_DEVICES"].split(",") if d]
 
     try:
-        return len(GPUtil.getGPUs())
+        return [str(gpu.id) for gpu in GPUtil.getGPUs()]
     except Exception:
-        return 0
+        return []
 
 
 def is_inside_mpi() -> bool:
@@ -186,29 +189,31 @@ def is_inside_mpi() -> bool:
     return any(v in os.environ for v in mpi_env_vars)
 
 
-def is_mps_running() -> bool:
-    """Check if the CUDA MPS daemon is currently running.
+def _mps_pid_file() -> pathlib.Path:
+    """The pid file the MPS control daemon writes into its pipe directory."""
+    pipe_dir = os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "/tmp/nvidia-mps")
+    return pathlib.Path(pipe_dir, "nvidia-cuda-mps-control.pid")
 
-    Uses a ps-based process check instead of the interactive control
+
+def is_mps_running() -> bool:
+    """Check if a CUDA MPS control daemon is serving ``CUDA_MPS_PIPE_DIRECTORY``.
+
+    Reads the daemon's pid file rather than querying the interactive control
     pipe, which can hang on newer NVIDIA drivers (580+).
     """
 
-    if not shutil.which("nvidia-cuda-mps-control"):
+    try:
+        os.kill(int(_mps_pid_file().read_text()), 0)
+    except PermissionError:
+        return True  # alive, but owned by another user
+    except (OSError, ValueError):
         return False
 
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "nvidia-cuda-mps-server"],
-            capture_output=True,
-            timeout=3,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
+    return True
 
 
 def start_mps() -> None:
-    """Start the CUDA MPS daemon.
+    """Start a CUDA MPS control daemon on ``CUDA_MPS_PIPE_DIRECTORY``.
 
     Raises:
         RuntimeError: If ``nvidia-cuda-mps-control`` is not found or fails to start.
@@ -226,9 +231,14 @@ def start_mps() -> None:
 
     _LOGGER.info("Starting CUDA MPS daemon")
     subprocess.run(["nvidia-cuda-mps-control", "-d"], check=True)
-    # Allow the daemon a moment to become ready before MPI ranks attach
-    import time
-    time.sleep(2)
+
+    # wait for the daemon to become ready before any clients attach
+    for _ in range(100):
+        if is_mps_running():
+            return
+        time.sleep(0.1)
+
+    raise RuntimeError("CUDA MPS control daemon did not start")
 
 
 def stop_mps() -> None:
@@ -263,6 +273,68 @@ def mps_context():
     finally:
         if not already_running:
             stop_mps()
+
+
+@contextlib.contextmanager
+def node_mps(mpi_comm: "MPI.Intracomm"):
+    """Run one CUDA MPS control daemon per node while more ranks than GPUs share it.
+
+    The first rank on each host starts a daemon on a fresh pipe directory, and stops
+    it again on exit, so only daemons started here are ever shut down. If
+    ``CUDA_MPS_PIPE_DIRECTORY`` is already set (e.g. a site managed daemon), that
+    daemon is used as-is. Must be entered before any CUDA context is created.
+    """
+    from mpi4py import MPI
+
+    node_comm = mpi_comm.Split_type(MPI.COMM_TYPE_SHARED)
+    n_devices = len(_visible_devices())
+
+    if n_devices == 0 or node_comm.size <= n_devices:
+        yield
+        return
+
+    ranks_per_gpu = -(-node_comm.size // n_devices)
+    os.environ.setdefault(
+        "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", str(max(1, 200 // ranks_per_gpu))
+    )
+
+    owned = "CUDA_MPS_PIPE_DIRECTORY" not in os.environ
+    root_dir, error = None, None
+
+    if owned and node_comm.rank == 0:
+        # the pipe socket path must stay short, so avoid a (long) $TMPDIR
+        root_dir = tempfile.mkdtemp(prefix="femto-mps-", dir="/tmp")
+        os.environ["CUDA_MPS_PIPE_DIRECTORY"] = os.path.join(root_dir, "pipe")
+        os.environ["CUDA_MPS_LOG_DIRECTORY"] = os.path.join(root_dir, "log")
+        try:
+            start_mps()
+        except Exception as e:
+            error = f"{socket.gethostname()}: {e}"
+
+    if owned:
+        root_dir, error = node_comm.bcast((root_dir, error), root=0)
+        if error is not None:
+            raise RuntimeError(f"failed to start CUDA MPS on {error}")
+
+        os.environ["CUDA_MPS_PIPE_DIRECTORY"] = os.path.join(root_dir, "pipe")
+        os.environ["CUDA_MPS_LOG_DIRECTORY"] = os.path.join(root_dir, "log")
+
+    try:
+        yield
+    finally:
+        if owned:
+            node_comm.Barrier()
+            if node_comm.rank == 0:
+                # 'quit' blocks until every client (including this process) has
+                # disconnected, so let it finish in the background after we exit
+                subprocess.Popen(
+                    "echo quit | nvidia-cuda-mps-control; "
+                    f"rm -rf {shlex.quote(root_dir)}",
+                    shell=True,
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
 
 
 def _strip_oversubscribe_from_argv(argv: list[str]) -> list[str]:
@@ -311,7 +383,7 @@ def launch_with_mps(
         RuntimeError: If no CUDA devices or MPI launcher can be found.
     """
 
-    n_gpus = _count_cuda_devices()
+    n_gpus = len(_visible_devices())
 
     if n_gpus == 0:
         raise RuntimeError(
@@ -353,29 +425,34 @@ def launch_with_mps(
 
 
 def divide_gpus():
-    """Attempts to divide the available GPUs across MPI ranks. If there are more ranks
-    than GPUs, then each GPU will be assigned to multiple ranks.
+    """Attempts to divide the GPUs visible on each node across the MPI ranks running
+    on that node. If there are more ranks than GPUs, then each GPU will be assigned
+    to multiple ranks.
     """
     import mpi4py.MPI
 
     hostname = socket.gethostname()
 
     with get_mpi_comm() as mpi_comm:
-        n_cuda_devices = _count_cuda_devices()
+        node_comm = mpi_comm.Split_type(mpi4py.MPI.COMM_TYPE_SHARED)
+        devices = _visible_devices()
 
-        if n_cuda_devices > 0:
-            device_idx = mpi_comm.rank % n_cuda_devices
-            ranks_per_gpu = max(1, mpi_comm.size // n_cuda_devices)
+        if len(devices) > 0:
+            local_idx = node_comm.rank % len(devices)
+            ranks_per_gpu = -(-node_comm.size // len(devices))
+            use_mps = ranks_per_gpu > 1 and is_mps_running()
 
-            os.environ["CUDA_VISIBLE_DEVICES"] = f"{device_idx}"
+            # MPS clients see devices renumbered relative to the daemon's visible list
+            device_id = str(local_idx) if use_mps else devices[local_idx]
+            os.environ["CUDA_VISIBLE_DEVICES"] = device_id
 
             _LOGGER.debug(
                 f"hostname={hostname} "
-                f"rank={mpi4py.MPI.COMM_WORLD.rank} will use GPU={device_idx} "
+                f"rank={mpi_comm.rank} will use GPU={device_id} "
                 f"({ranks_per_gpu} ranks/GPU)"
             )
 
-            if ranks_per_gpu > 1 and not is_mps_running():
+            if ranks_per_gpu > 1 and not use_mps:
                 _LOGGER.warning(
                     f"Multiple MPI ranks ({ranks_per_gpu}) are sharing each GPU "
                     f"but CUDA MPS does not appear to be running. Performance "
