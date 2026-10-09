@@ -535,18 +535,17 @@ def _store_checkpoint(
     n_proposed_swaps: numpy.ndarray,
     n_accepted_swaps: numpy.ndarray,
     replica_to_state_idx: numpy.ndarray,
-    replica_idx_offset: int,
     path: pathlib.Path,
     mpi_comm: "MPI.Intracomm",
 ):
     """Store the state of an HREMD simulation to a pickle checkpoint."""
-    coords_dict = {i + replica_idx_offset: coord for i, coord in enumerate(coords)}
-    coords_dict = femto.md.utils.mpi.reduce_dict(coords_dict, mpi_comm, root=0)
+    # ranks hold contiguous, ascending blocks of replicas (see ``divide_tasks``)
+    coords = mpi_comm.gather(coords, root=0)
 
     if mpi_comm.rank != 0:
         return
 
-    coords = [coords_dict[i] for i in range(len(u_kn))]
+    coords = [coord for rank_coords in coords for coord in rank_coords]
 
     path.parent.mkdir(exist_ok=True, parents=True)
 
@@ -577,6 +576,7 @@ def run_hremd(
     analysis_fn: typing.Callable[[int, numpy.ndarray, numpy.ndarray], None]
     | None = None,
     analysis_interval: int | None = None,
+    save_final_coords: bool = True,
 ) -> tuple[numpy.ndarray, numpy.ndarray, list[openmm.State]]:
     """Run a Hamiltonian replica exchange simulation.
 
@@ -598,10 +598,13 @@ def run_hremd(
             state with ``shape=(n_states,)``.
         analysis_interval: The interval with which to call the analysis function.
             If ``None``, no analysis will be performed.
+        save_final_coords: Whether to gather the final coordinates of every replica
+            onto every rank. If ``False``, ``None`` is returned in their place.
 
     Returns:
         The reduced potentials, the number of samples of each state, and the final
-        coordinates of each state.
+        coordinates of each state. The reduced potentials and number of samples are
+        only returned on rank 0, and are ``None`` on all other ranks.
     """
     from mpi4py import MPI
 
@@ -619,12 +622,6 @@ def run_hremd(
 
     replica_to_state_idx = numpy.arange(n_states)
 
-    u_kn, n_k = (
-        numpy.empty((n_states, n_states * config.n_cycles)),
-        numpy.zeros(n_states, dtype=int),
-    )
-    has_sampled = numpy.zeros(n_states * config.n_cycles, bool)
-
     pressure = femto.md.utils.openmm.get_pressure(simulation.system)
 
     samples_path = None if output_dir is None else output_dir / "samples.arrow"
@@ -638,22 +635,8 @@ def run_hremd(
 
     start_cycle = 0
 
-    if checkpoint_path is not None and checkpoint_path.exists():
-        (
-            start_cycle,
-            initial_coords,
-            u_kn,
-            n_k,
-            has_sampled,
-            n_proposed_swaps,
-            n_accepted_swaps,
-            replica_to_state_idx,
-        ) = _load_checkpoint(config, n_states, checkpoint_path)
-        _LOGGER.info(f"resuming from cycle {start_cycle} samples")
-
     with (
         femto.md.utils.mpi.get_mpi_comm() as mpi_comm,
-        _create_storage(mpi_comm, samples_path, n_states, start_cycle) as storage,
         contextlib.ExitStack() as exit_stack,
     ):
         # each MPI process may be responsible for propagating multiple states,
@@ -662,13 +645,54 @@ def run_hremd(
             mpi_comm, n_states
         )
 
-        if initial_coords is None:
+        resume = mpi_comm.bcast(
+            checkpoint_path is not None and checkpoint_path.exists(), root=0
+        )
+
+        # the sampled potentials are only needed by rank 0, which reports them
+        u_kn, n_k, has_sampled = None, None, None
+
+        if mpi_comm.rank == 0 and not resume:
+            u_kn = numpy.empty((n_states, n_states * config.n_cycles))
+            n_k = numpy.zeros(n_states, dtype=int)
+            has_sampled = numpy.zeros(n_states * config.n_cycles, bool)
+
+        if resume:
+            replica_blocks = mpi_comm.gather((replica_idx_offset, n_replicas), root=0)
+            coords = None
+
+            if mpi_comm.rank == 0:
+                (
+                    start_cycle,
+                    checkpoint_coords,
+                    u_kn,
+                    n_k,
+                    has_sampled,
+                    n_proposed_swaps,
+                    n_accepted_swaps,
+                    replica_to_state_idx,
+                ) = _load_checkpoint(config, n_states, checkpoint_path)
+                _LOGGER.info(f"resuming from cycle {start_cycle} samples")
+
+                # only send each rank the coordinates of the replicas it propagates
+                coords = [checkpoint_coords[i : i + n] for i, n in replica_blocks]
+                del checkpoint_coords
+
+            coords = mpi_comm.scatter(coords, root=0)
+            start_cycle, replica_to_state_idx = mpi_comm.bcast(
+                (start_cycle, replica_to_state_idx), root=0
+            )
+        elif initial_coords is None:
             coords_0 = simulation.context.getState(
                 getPositions=True, enforcePeriodicBox=config.trajectory_enforce_pbc
             )
             coords = [coords_0] * n_replicas
         else:
             coords = [initial_coords[i + replica_idx_offset] for i in range(n_replicas)]
+
+        storage = exit_stack.enter_context(
+            _create_storage(mpi_comm, samples_path, n_states, start_cycle)
+        )
 
         if start_cycle == 0:
             if mpi_comm.rank == 0:
@@ -723,10 +747,13 @@ def run_hremd(
             )
             reduced_potentials = mpi_comm.reduce(reduced_potentials, MPI.SUM, 0)
 
-            has_sampled[replica_to_state_idx * config.n_cycles + cycle] = True
-            u_kn[:, replica_to_state_idx * config.n_cycles + cycle] = reduced_potentials
+            if mpi_comm.rank == 0:
+                has_sampled[replica_to_state_idx * config.n_cycles + cycle] = True
+                u_kn[:, replica_to_state_idx * config.n_cycles + cycle] = (
+                    reduced_potentials
+                )
 
-            n_k += 1
+                n_k += 1
 
             should_save_trajectory = (
                 config.trajectory_interval is not None
@@ -786,16 +813,24 @@ def run_hremd(
                     n_proposed_swaps,
                     n_accepted_swaps,
                     replica_to_state_idx,
-                    replica_idx_offset,
                     checkpoint_path,
                     mpi_comm,
                 )
 
         mpi_comm.barrier()
 
-        coords_dict = {i + replica_idx_offset: coord for i, coord in enumerate(coords)}
-        coords_dict = femto.md.utils.mpi.reduce_dict(coords_dict, mpi_comm, root=None)
+        final_coords = None
 
-        final_coords = [coords_dict[replica_to_state_idx[i]] for i in range(n_states)]
+        if save_final_coords:
+            coords_dict = {
+                i + replica_idx_offset: coord for i, coord in enumerate(coords)
+            }
+            coords_dict = femto.md.utils.mpi.reduce_dict(
+                coords_dict, mpi_comm, root=None
+            )
+
+            final_coords = [
+                coords_dict[replica_to_state_idx[i]] for i in range(n_states)
+            ]
 
     return u_kn, n_k, final_coords
