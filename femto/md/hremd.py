@@ -610,8 +610,7 @@ def run_hremd(
 
     Returns:
         The reduced potentials, the number of samples of each state, and the final
-        coordinates of each state. The reduced potentials and number of samples are
-        only returned on rank 0, and are ``None`` on all other ranks.
+        coordinates of each state.
     """
     from mpi4py import MPI
 
@@ -629,6 +628,12 @@ def run_hremd(
 
     replica_to_state_idx = numpy.arange(n_states)
 
+    u_kn, n_k = (
+        numpy.empty((n_states, n_states * config.n_cycles)),
+        numpy.zeros(n_states, dtype=int),
+    )
+    has_sampled = numpy.zeros(n_states * config.n_cycles, bool)
+
     pressure = femto.md.utils.openmm.get_pressure(simulation.system)
 
     samples_path = None if output_dir is None else output_dir / "samples.arrow"
@@ -642,8 +647,22 @@ def run_hremd(
 
     start_cycle = 0
 
+    if checkpoint_path is not None and checkpoint_path.exists():
+        (
+            start_cycle,
+            initial_coords,
+            u_kn,
+            n_k,
+            has_sampled,
+            n_proposed_swaps,
+            n_accepted_swaps,
+            replica_to_state_idx,
+        ) = _load_checkpoint(config, n_states, checkpoint_path)
+        _LOGGER.info(f"resuming from cycle {start_cycle} samples")
+
     with (
         femto.md.utils.mpi.get_mpi_comm() as mpi_comm,
+        _create_storage(mpi_comm, samples_path, n_states, start_cycle) as storage,
         contextlib.ExitStack() as exit_stack,
     ):
         # each MPI process may be responsible for propagating multiple states,
@@ -652,53 +671,13 @@ def run_hremd(
             mpi_comm, n_states
         )
 
-        resume = mpi_comm.bcast(
-            checkpoint_path is not None and checkpoint_path.exists(), root=0
-        )
-
-        # the sampled potentials are only needed by rank 0, which reports them
-        u_kn, n_k, has_sampled = None, None, None
-
-        if mpi_comm.rank == 0 and not resume:
-            u_kn = numpy.empty((n_states, n_states * config.n_cycles))
-            n_k = numpy.zeros(n_states, dtype=int)
-            has_sampled = numpy.zeros(n_states * config.n_cycles, bool)
-
-        if resume:
-            # every rank reads the checkpoint itself (it must be on a filesystem all
-            # nodes share) and keeps only its own replicas, so no coordinates are
-            # sent between ranks at startup
-            (
-                start_cycle,
-                checkpoint_coords,
-                u_kn,
-                n_k,
-                has_sampled,
-                n_proposed_swaps,
-                n_accepted_swaps,
-                replica_to_state_idx,
-            ) = _load_checkpoint(config, n_states, checkpoint_path)
-
-            coords = checkpoint_coords[
-                replica_idx_offset : replica_idx_offset + n_replicas
-            ]
-            del checkpoint_coords
-
-            if mpi_comm.rank == 0:
-                _LOGGER.info(f"resuming from cycle {start_cycle} samples")
-            else:
-                u_kn, n_k, has_sampled = None, None, None
-        elif initial_coords is None:
+        if initial_coords is None:
             coords_0 = simulation.context.getState(
                 getPositions=True, enforcePeriodicBox=config.trajectory_enforce_pbc
             )
             coords = [coords_0] * n_replicas
         else:
             coords = [initial_coords[i + replica_idx_offset] for i in range(n_replicas)]
-
-        storage = exit_stack.enter_context(
-            _create_storage(mpi_comm, samples_path, n_states, start_cycle)
-        )
 
         if start_cycle == 0:
             if mpi_comm.rank == 0:
@@ -753,13 +732,10 @@ def run_hremd(
             )
             reduced_potentials = mpi_comm.reduce(reduced_potentials, MPI.SUM, 0)
 
-            if mpi_comm.rank == 0:
-                has_sampled[replica_to_state_idx * config.n_cycles + cycle] = True
-                u_kn[:, replica_to_state_idx * config.n_cycles + cycle] = (
-                    reduced_potentials
-                )
+            has_sampled[replica_to_state_idx * config.n_cycles + cycle] = True
+            u_kn[:, replica_to_state_idx * config.n_cycles + cycle] = reduced_potentials
 
-                n_k += 1
+            n_k += 1
 
             should_save_trajectory = (
                 config.trajectory_interval is not None
