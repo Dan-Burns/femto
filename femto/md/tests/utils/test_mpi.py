@@ -250,7 +250,8 @@ class TestMpsContext:
 
 class TestNodeMps:
     @pytest.fixture
-    def mock_env(self, mocker):
+    def mock_env(self, mocker, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)  # node_mps writes logs to ./mps-logs
         env = {"CUDA_VISIBLE_DEVICES": "0"}
         mocker.patch.dict(os.environ, env, clear=True)
         return env

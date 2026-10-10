@@ -300,16 +300,19 @@ def node_mps(mpi_comm: "MPI.Intracomm"):
 
     owned = "CUDA_MPS_PIPE_DIRECTORY" not in os.environ
     root_dir, error = None, None
+    # logs go in the working directory so they survive the job (and cleanup)
+    log_dir = os.path.abspath(os.path.join("mps-logs", socket.gethostname()))
 
     if owned and node_comm.rank == 0:
         # the pipe socket path must stay short, so avoid a (long) $TMPDIR
         root_dir = tempfile.mkdtemp(prefix="femto-mps-", dir="/tmp")
         os.environ["CUDA_MPS_PIPE_DIRECTORY"] = os.path.join(root_dir, "pipe")
-        os.environ["CUDA_MPS_LOG_DIRECTORY"] = os.path.join(root_dir, "log")
+        os.environ["CUDA_MPS_LOG_DIRECTORY"] = log_dir
         try:
+            os.makedirs(log_dir, exist_ok=True)
             start_mps()
         except Exception as e:
-            error = f"{socket.gethostname()}: {e}"
+            error = f"{socket.gethostname()}: {e} (see {log_dir})"
 
     if owned:
         root_dir, error = node_comm.bcast((root_dir, error), root=0)
@@ -317,7 +320,7 @@ def node_mps(mpi_comm: "MPI.Intracomm"):
             raise RuntimeError(f"failed to start CUDA MPS on {error}")
 
         os.environ["CUDA_MPS_PIPE_DIRECTORY"] = os.path.join(root_dir, "pipe")
-        os.environ["CUDA_MPS_LOG_DIRECTORY"] = os.path.join(root_dir, "log")
+        os.environ["CUDA_MPS_LOG_DIRECTORY"] = log_dir
 
     try:
         yield
