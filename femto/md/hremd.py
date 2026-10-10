@@ -535,24 +535,18 @@ def _store_checkpoint(
     n_proposed_swaps: numpy.ndarray,
     n_accepted_swaps: numpy.ndarray,
     replica_to_state_idx: numpy.ndarray,
+    replica_idx_offset: int,
     path: pathlib.Path,
     mpi_comm: "MPI.Intracomm",
 ):
     """Store the state of an HREMD simulation to a pickle checkpoint."""
-    # send one replica per message: a single message over 2 GB fails in MPI.
-    # Ranks hold contiguous, ascending blocks of replicas (see ``divide_tasks``)
-    n_replicas = mpi_comm.gather(len(coords), root=0)
+    coords_dict = {i + replica_idx_offset: coord for i, coord in enumerate(coords)}
+    coords_dict = femto.md.utils.mpi.reduce_dict(coords_dict, mpi_comm, root=0)
 
     if mpi_comm.rank != 0:
-        for coord in coords:
-            mpi_comm.send(coord, dest=0)
         return
 
-    coords = list(coords) + [
-        mpi_comm.recv(source=rank)
-        for rank in range(1, mpi_comm.size)
-        for _ in range(n_replicas[rank])
-    ]
+    coords = [coords_dict[i] for i in range(len(u_kn))]
 
     path.parent.mkdir(exist_ok=True, parents=True)
 
@@ -795,6 +789,7 @@ def run_hremd(
                     n_proposed_swaps,
                     n_accepted_swaps,
                     replica_to_state_idx,
+                    replica_idx_offset,
                     checkpoint_path,
                     mpi_comm,
                 )
