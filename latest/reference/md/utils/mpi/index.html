@@ -3570,19 +3570,19 @@ daemon is used as-is. Must be entered before any CUDA context is created.</p>
 </span><span id="__span-0-322"><a id="__codelineno-0-322" name="__codelineno-0-322"></a>    <span class="k">try</span><span class="p">:</span>
 </span><span id="__span-0-323"><a id="__codelineno-0-323" name="__codelineno-0-323"></a>        <span class="k">yield</span>
 </span><span id="__span-0-324"><a id="__codelineno-0-324" name="__codelineno-0-324"></a>    <span class="k">finally</span><span class="p">:</span>
-</span><span id="__span-0-325"><a id="__codelineno-0-325" name="__codelineno-0-325"></a>        <span class="k">if</span> <span class="n">owned</span><span class="p">:</span>
-</span><span id="__span-0-326"><a id="__codelineno-0-326" name="__codelineno-0-326"></a>            <span class="n">node_comm</span><span class="o">.</span><span class="n">Barrier</span><span class="p">()</span>
-</span><span id="__span-0-327"><a id="__codelineno-0-327" name="__codelineno-0-327"></a>            <span class="k">if</span> <span class="n">node_comm</span><span class="o">.</span><span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-</span><span id="__span-0-328"><a id="__codelineno-0-328" name="__codelineno-0-328"></a>                <span class="c1"># 'quit' blocks until every client (including this process) has</span>
-</span><span id="__span-0-329"><a id="__codelineno-0-329" name="__codelineno-0-329"></a>                <span class="c1"># disconnected, so let it finish in the background after we exit</span>
-</span><span id="__span-0-330"><a id="__codelineno-0-330" name="__codelineno-0-330"></a>                <span class="n">subprocess</span><span class="o">.</span><span class="n">Popen</span><span class="p">(</span>
-</span><span id="__span-0-331"><a id="__codelineno-0-331" name="__codelineno-0-331"></a>                    <span class="s2">"echo quit | nvidia-cuda-mps-control; "</span>
-</span><span id="__span-0-332"><a id="__codelineno-0-332" name="__codelineno-0-332"></a>                    <span class="sa">f</span><span class="s2">"rm -rf </span><span class="si">{</span><span class="n">shlex</span><span class="o">.</span><span class="n">quote</span><span class="p">(</span><span class="n">root_dir</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span>
-</span><span id="__span-0-333"><a id="__codelineno-0-333" name="__codelineno-0-333"></a>                    <span class="n">shell</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-</span><span id="__span-0-334"><a id="__codelineno-0-334" name="__codelineno-0-334"></a>                    <span class="n">start_new_session</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-</span><span id="__span-0-335"><a id="__codelineno-0-335" name="__codelineno-0-335"></a>                    <span class="n">stdout</span><span class="o">=</span><span class="n">subprocess</span><span class="o">.</span><span class="n">DEVNULL</span><span class="p">,</span>
-</span><span id="__span-0-336"><a id="__codelineno-0-336" name="__codelineno-0-336"></a>                    <span class="n">stderr</span><span class="o">=</span><span class="n">subprocess</span><span class="o">.</span><span class="n">DEVNULL</span><span class="p">,</span>
-</span><span id="__span-0-337"><a id="__codelineno-0-337" name="__codelineno-0-337"></a>                <span class="p">)</span>
+</span><span id="__span-0-325"><a id="__codelineno-0-325" name="__codelineno-0-325"></a>        <span class="c1"># no barrier here: if a rank is raising, its peers may never reach one,</span>
+</span><span id="__span-0-326"><a id="__codelineno-0-326" name="__codelineno-0-326"></a>        <span class="c1"># which would hang the job instead of letting get_mpi_comm abort it</span>
+</span><span id="__span-0-327"><a id="__codelineno-0-327" name="__codelineno-0-327"></a>        <span class="k">if</span> <span class="n">owned</span> <span class="ow">and</span> <span class="n">node_comm</span><span class="o">.</span><span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+</span><span id="__span-0-328"><a id="__codelineno-0-328" name="__codelineno-0-328"></a>            <span class="c1"># 'quit' blocks until every client on the node (including this</span>
+</span><span id="__span-0-329"><a id="__codelineno-0-329" name="__codelineno-0-329"></a>            <span class="c1"># process) has disconnected, so let it finish in the background</span>
+</span><span id="__span-0-330"><a id="__codelineno-0-330" name="__codelineno-0-330"></a>            <span class="n">subprocess</span><span class="o">.</span><span class="n">Popen</span><span class="p">(</span>
+</span><span id="__span-0-331"><a id="__codelineno-0-331" name="__codelineno-0-331"></a>                <span class="s2">"echo quit | nvidia-cuda-mps-control; "</span>
+</span><span id="__span-0-332"><a id="__codelineno-0-332" name="__codelineno-0-332"></a>                <span class="sa">f</span><span class="s2">"rm -rf </span><span class="si">{</span><span class="n">shlex</span><span class="o">.</span><span class="n">quote</span><span class="p">(</span><span class="n">root_dir</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span>
+</span><span id="__span-0-333"><a id="__codelineno-0-333" name="__codelineno-0-333"></a>                <span class="n">shell</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-0-334"><a id="__codelineno-0-334" name="__codelineno-0-334"></a>                <span class="n">start_new_session</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-0-335"><a id="__codelineno-0-335" name="__codelineno-0-335"></a>                <span class="n">stdout</span><span class="o">=</span><span class="n">subprocess</span><span class="o">.</span><span class="n">DEVNULL</span><span class="p">,</span>
+</span><span id="__span-0-336"><a id="__codelineno-0-336" name="__codelineno-0-336"></a>                <span class="n">stderr</span><span class="o">=</span><span class="n">subprocess</span><span class="o">.</span><span class="n">DEVNULL</span><span class="p">,</span>
+</span><span id="__span-0-337"><a id="__codelineno-0-337" name="__codelineno-0-337"></a>            <span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
             </details>
     </div>
