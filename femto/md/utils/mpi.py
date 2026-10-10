@@ -322,19 +322,19 @@ def node_mps(mpi_comm: "MPI.Intracomm"):
     try:
         yield
     finally:
-        if owned:
-            node_comm.Barrier()
-            if node_comm.rank == 0:
-                # 'quit' blocks until every client (including this process) has
-                # disconnected, so let it finish in the background after we exit
-                subprocess.Popen(
-                    "echo quit | nvidia-cuda-mps-control; "
-                    f"rm -rf {shlex.quote(root_dir)}",
-                    shell=True,
-                    start_new_session=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+        # no barrier here: if a rank is raising, its peers may never reach one,
+        # which would hang the job instead of letting get_mpi_comm abort it
+        if owned and node_comm.rank == 0:
+            # 'quit' blocks until every client on the node (including this
+            # process) has disconnected, so let it finish in the background
+            subprocess.Popen(
+                "echo quit | nvidia-cuda-mps-control; "
+                f"rm -rf {shlex.quote(root_dir)}",
+                shell=True,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
 
 def _strip_oversubscribe_from_argv(argv: list[str]) -> list[str]:
