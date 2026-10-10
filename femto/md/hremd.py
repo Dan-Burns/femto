@@ -539,13 +539,20 @@ def _store_checkpoint(
     mpi_comm: "MPI.Intracomm",
 ):
     """Store the state of an HREMD simulation to a pickle checkpoint."""
-    # ranks hold contiguous, ascending blocks of replicas (see ``divide_tasks``)
-    coords = mpi_comm.gather(coords, root=0)
+    # send one replica per message: a single message over 2 GB fails in MPI.
+    # Ranks hold contiguous, ascending blocks of replicas (see ``divide_tasks``)
+    n_replicas = mpi_comm.gather(len(coords), root=0)
 
     if mpi_comm.rank != 0:
+        for coord in coords:
+            mpi_comm.send(coord, dest=0)
         return
 
-    coords = [coord for rank_coords in coords for coord in rank_coords]
+    coords = list(coords) + [
+        mpi_comm.recv(source=rank)
+        for rank in range(1, mpi_comm.size)
+        for _ in range(n_replicas[rank])
+    ]
 
     path.parent.mkdir(exist_ok=True, parents=True)
 
@@ -659,7 +666,6 @@ def run_hremd(
 
         if resume:
             replica_blocks = mpi_comm.gather((replica_idx_offset, n_replicas), root=0)
-            coords = None
 
             if mpi_comm.rank == 0:
                 (
@@ -674,11 +680,16 @@ def run_hremd(
                 ) = _load_checkpoint(config, n_states, checkpoint_path)
                 _LOGGER.info(f"resuming from cycle {start_cycle} samples")
 
-                # only send each rank the coordinates of the replicas it propagates
-                coords = [checkpoint_coords[i : i + n] for i, n in replica_blocks]
-                del checkpoint_coords
+                # only send each rank the coordinates of the replicas it propagates,
+                # one replica per message: a single message over 2 GB fails in MPI
+                for rank, (i, n) in enumerate(replica_blocks[1:], start=1):
+                    for coord in checkpoint_coords[i : i + n]:
+                        mpi_comm.send(coord, dest=rank)
 
-            coords = mpi_comm.scatter(coords, root=0)
+                coords = checkpoint_coords[:n_replicas]
+                del checkpoint_coords
+            else:
+                coords = [mpi_comm.recv(source=0) for _ in range(n_replicas)]
             start_cycle, replica_to_state_idx = mpi_comm.bcast(
                 (start_cycle, replica_to_state_idx), root=0
             )
