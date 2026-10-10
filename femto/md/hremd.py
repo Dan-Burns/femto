@@ -665,34 +665,29 @@ def run_hremd(
             has_sampled = numpy.zeros(n_states * config.n_cycles, bool)
 
         if resume:
-            replica_blocks = mpi_comm.gather((replica_idx_offset, n_replicas), root=0)
+            # every rank reads the checkpoint itself (it must be on a filesystem all
+            # nodes share) and keeps only its own replicas, so no coordinates are
+            # sent between ranks at startup
+            (
+                start_cycle,
+                checkpoint_coords,
+                u_kn,
+                n_k,
+                has_sampled,
+                n_proposed_swaps,
+                n_accepted_swaps,
+                replica_to_state_idx,
+            ) = _load_checkpoint(config, n_states, checkpoint_path)
+
+            coords = checkpoint_coords[
+                replica_idx_offset : replica_idx_offset + n_replicas
+            ]
+            del checkpoint_coords
 
             if mpi_comm.rank == 0:
-                (
-                    start_cycle,
-                    checkpoint_coords,
-                    u_kn,
-                    n_k,
-                    has_sampled,
-                    n_proposed_swaps,
-                    n_accepted_swaps,
-                    replica_to_state_idx,
-                ) = _load_checkpoint(config, n_states, checkpoint_path)
                 _LOGGER.info(f"resuming from cycle {start_cycle} samples")
-
-                # only send each rank the coordinates of the replicas it propagates,
-                # one replica per message: a single message over 2 GB fails in MPI
-                for rank, (i, n) in enumerate(replica_blocks[1:], start=1):
-                    for coord in checkpoint_coords[i : i + n]:
-                        mpi_comm.send(coord, dest=rank)
-
-                coords = checkpoint_coords[:n_replicas]
-                del checkpoint_coords
             else:
-                coords = [mpi_comm.recv(source=0) for _ in range(n_replicas)]
-            start_cycle, replica_to_state_idx = mpi_comm.bcast(
-                (start_cycle, replica_to_state_idx), root=0
-            )
+                u_kn, n_k, has_sampled = None, None, None
         elif initial_coords is None:
             coords_0 = simulation.context.getState(
                 getPositions=True, enforcePeriodicBox=config.trajectory_enforce_pbc
